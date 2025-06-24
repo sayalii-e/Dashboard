@@ -1,437 +1,204 @@
 <?php
-// Redis Cache Monitor for Tuesday Dashboard
-// This script provides statistics about Redis cache usage
+/**
+ * Cache Monitor Placeholder
+ *
+ * This file is intended for monitoring or managing a caching system
+ * used by the placement agencies dashboard.
+ *
+ * As no specific caching mechanism (e.g., APCu, Memcached, Redis, file-based)
+ * was defined in the requirements, this file serves as a basic placeholder.
+ *
+ * To make this functional, you would typically:
+ * 1. Integrate with your chosen caching library/system.
+ * 2. Implement functions to:
+ *    - Display cache statistics (hit rate, miss rate, memory usage, number of cached items).
+ *    - Allow clearing parts or all of the cache (with appropriate security).
+ *    - View cached keys or items (for debugging, if feasible and secure).
+ *
+ * Security Note: Exposing cache management functionality, especially cache clearing,
+ * should be protected and restricted to authorized users only.
+ */
 
-// Redis configuration - must match the settings in data.php
-$redisHost = 'localhost';
-$redisPort = 6379;
-$redisPassword = null; // Set this if your Redis server requires authentication
-$redisTimeout = 2.5;
+// Basic security check example (very simple, enhance for production)
+// session_start(); // Uncomment if using sessions for auth
+// if (!isset($_SESSION['is_admin']) || $_SESSION['is_admin'] !== true) {
+//     // For a real application, you'd have a proper authentication system.
+//     // header('HTTP/1.1 403 Forbidden');
+//     // die('Access denied. You must be an administrator to view this page.');
+// }
 
-// Initialize Redis connection
-try {
-    $redis = new Redis();
-    $connected = $redis->connect($redisHost, $redisPort, $redisTimeout);
-    if ($connected && $redisPassword) {
-        $redis->auth($redisPassword);
-    }
-    if (!$connected) {
-        die("Redis connection failed");
-    }
-} catch (Exception $e) {
-    die("Redis error: " . $e->getMessage());
-}
 
-// Get Redis info
-$info = $redis->info();
-$dbSize = $redis->dbSize();
-$tuesdayKeys = $redis->keys('tuesday_*');
-$totalTuesdayKeys = count($tuesdayKeys);
+header('Content-Type: text/html; charset=utf-8');
 
-// Get memory usage
-$usedMemory = formatBytes($info['used_memory']);
-$usedMemoryPeak = formatBytes($info['used_memory_peak']);
-
-// Get hit/miss ratio
-$keyspaceHits = isset($info['keyspace_hits']) ? $info['keyspace_hits'] : 0;
-$keyspaceMisses = isset($info['keyspace_misses']) ? $info['keyspace_misses'] : 0;
-$totalRequests = $keyspaceHits + $keyspaceMisses;
-$hitRatio = $totalRequests > 0 ? round(($keyspaceHits / $totalRequests) * 100, 2) : 0;
-
-// Format bytes to human-readable format
-function formatBytes($bytes, $precision = 2) {
-    $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    $bytes = max($bytes, 0);
-    $pow = floor(($bytes ? log($bytes) : 0) / log(1024));
-    $pow = min($pow, count($units) - 1);
-    $bytes /= (1 << (10 * $pow));
-    return round($bytes, $precision) . ' ' . $units[$pow];
-}
-
-// Get key types and expiry times
-$keyDetails = [];
-foreach ($tuesdayKeys as $key) {
-    $type = $redis->type($key);
-    $ttl = $redis->ttl($key);
-    $size = 0;
-    
-    // Get size based on type
-    if ($type == Redis::REDIS_STRING) {
-        $value = $redis->get($key);
-        $size = strlen($value);
-    } elseif ($type == Redis::REDIS_HASH) {
-        $size = $redis->hLen($key);
-    } elseif ($type == Redis::REDIS_LIST) {
-        $size = $redis->lLen($key);
-    } elseif ($type == Redis::REDIS_SET) {
-        $size = $redis->sCard($key);
-    } elseif ($type == Redis::REDIS_ZSET) {
-        $size = $redis->zCard($key);
-    }
-    
-    // Calculate creation date based on TTL and expiry time
-    $creationDate = 'Unknown';
-    if ($ttl > 0) {
-        $creationTimestamp = time() - (2592000 - $ttl);
-        $creationDate = date('Y-m-d H:i:s', $creationTimestamp);
-    }
-    
-    $keyDetails[] = [
-        'key' => $key,
-        'type' => getTypeName($type),
-        'ttl' => $ttl,
-        'expires_in' => formatTTL($ttl),
-        'size' => formatBytes($size),
-        'created_at' => $creationDate
-    ];
-}
-
-// Get type name
-function getTypeName($typeCode) {
-    switch ($typeCode) {
-        case Redis::REDIS_STRING: return 'String';
-        case Redis::REDIS_HASH: return 'Hash';
-        case Redis::REDIS_LIST: return 'List';
-        case Redis::REDIS_SET: return 'Set';
-        case Redis::REDIS_ZSET: return 'Sorted Set';
-        default: return 'Unknown';
-    }
-}
-
-// Format TTL
-function formatTTL($ttl) {
-    if ($ttl < 0) {
-        return 'No expiry';
-    }
-    
-    if ($ttl < 60) {
-        return "$ttl seconds";
-    }
-    
-    if ($ttl < 3600) {
-        $minutes = floor($ttl / 60);
-        $seconds = $ttl % 60;
-        return "$minutes min, $seconds sec";
-    }
-    
-    if ($ttl < 86400) {
-        $hours = floor($ttl / 3600);
-        $minutes = floor(($ttl % 3600) / 60);
-        return "$hours hr, $minutes min";
-    }
-    
-    // For values close to 30 days (2592000 seconds), show as 30 days
-    if ($ttl >= 2500000 && $ttl <= 2600000) {
-        return "30 days";
-    }
-    
-    $days = floor($ttl / 86400);
-    $hours = floor(($ttl % 86400) / 3600);
-    return "$days days, $hours hr";
-}
-
-// Handle cache flush action
-if (isset($_POST['flush_tuesday'])) {
-    foreach ($tuesdayKeys as $key) {
-        $redis->del($key);
-    }
-    header('Location: ' . $_SERVER['PHP_SELF']);
-    exit;
-}
-
-// Handle delete key action
-if (isset($_POST['delete_key'])) {
-    $keyToDelete = $_POST['delete_key'];
-    $redis->del($keyToDelete);
-    header('Location: ' . $_SERVER['PHP_SELF']);
-    exit;
-}
-
-// Handle sorting
-$sortField = isset($_GET['sort']) ? $_GET['sort'] : 'key';
-$sortOrder = isset($_GET['order']) ? $_GET['order'] : 'asc';
-
-// Validate sort field
-$validSortFields = ['key', 'type', 'size', 'expires_in', 'created_at'];
-if (!in_array($sortField, $validSortFields)) {
-    $sortField = 'key';
-}
-
-// Sort the key details array
-usort($keyDetails, function($a, $b) use ($sortField, $sortOrder) {
-    if ($sortOrder === 'asc') {
-        return $a[$sortField] <=> $b[$sortField];
-    } else {
-        return $b[$sortField] <=> $a[$sortField];
-    }
-});
-
-// HTML output
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Redis Cache Monitor - Tuesday Dashboard</title>
+    <title>Cache Monitor</title>
     <style>
-        :root {
-            --primary-color: #4a5d7e;
-            --secondary-color: #f0f2f5;
-            --text-color: #2c3e50;
-            --border-color: #d1d9e6;
-            --hover-color: #e6eaf0;
-            --success-color: #28a745;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            margin: 0;
-            padding: 20px;
-            background-color: #f5f7fa;
-            color: var(--text-color);
-        }
-        
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        
-        .header {
-            font-size: 24px;
-            font-weight: 600;
-            margin: 0;
-            padding-top: 20px;
-            padding-bottom: 10px;
-        }
-        
-        h1, h2, h3 {
-            color: var(--text-color);
-        }
-        
-        .card-header{
-            font-size: 18px;
-            font-weight: 500;
-            margin: 0;
-        }
-        
-        .card {
-            background-color: #fff;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
-            padding: 20px;
-            margin-bottom: 20px;
-        }
-        
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 20px;
-        }
-        
-        .stat-card {
-            background-color: #fff;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
-            padding: 20px;
-            text-align: center;
-        }
-        
-        .stat-value {
-            font-size: 24px;
-            font-weight: 600;
-            color: var(--primary-color);
-            margin: 10px 0;
-        }
-        
-        .stat-label {
-            font-size: 14px;
-            color: #6c757d;
-        }
-        
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 20px;
-        }
-        
-        th, td {
-            padding: 12px 15px;
-            text-align: left;
-            border-bottom: 1px solid var(--border-color);
-        }
-        
-        th {
-            background-color: var(--secondary-color);
-            font-weight: 600;
-        }
-        
-        tr:hover {
-            background-color: var(--hover-color);
-        }
-        
-        .progress-container {
-            width: 100%;
-            background-color: #e9ecef;
-            border-radius: 4px;
-            margin: 10px 0;
-        }
-        
-        .progress-bar {
-            height: 10px;
-            border-radius: 4px;
-            background-color: var(--primary-color);
-        }
-        
-        .actions {
-            margin-top: 20px;
-            display: flex;
-            gap: 10px;
-        }
-        
-        .btn {
-            padding: 8px 16px;
-            border-radius: 4px;
-            font-size: 14px;
-            font-weight: 500;
-            cursor: pointer;
-            border: none;
-            transition: all 0.2s;
-        }
-        
-        .btn-primary {
-            background-color: var(--primary-color);
-            color: white;
-        }
-        
-        .btn-danger {
-            background-color: #dc3545;
-            color: white;
-        }
-        
-        .btn:hover {
-            opacity: 0.9;
-        }
-        
-        .refresh-time {
-            font-size: 12px;
-            color: #6c757d;
-            text-align: right;
-            margin-top: 10px;
-        }
-        
-        .back-button {
+        body { font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f8f9fa; color: #212529; line-height: 1.6; }
+        .header { background-color: #007bff; color: white; padding: 20px; text-align: center; }
+        .container { max-width: 900px; margin: 30px auto; padding: 20px; background-color: #ffffff; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+        h1 { margin-top: 0; }
+        h2 { color: #007bff; border-bottom: 2px solid #dee2e6; padding-bottom: 10px; margin-top: 30px; }
+        p { margin-bottom: 15px; }
+        .info-box { background-color: #e9ecef; padding: 15px; border-radius: 5px; margin-bottom: 20px; border-left: 5px solid #007bff; }
+        .code-block { background-color: #f1f1f1; padding: 15px; border-radius: 5px; margin-top: 10px; font-family: 'Courier New', Courier, monospace; white-space: pre-wrap; word-wrap: break-word; border: 1px solid #ced4da; }
+        .action-button {
             display: inline-block;
-            padding: 10px 20px;
-            background-color: var(--primary-color);
+            background-color: #28a745;
             color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 5px;
             text-decoration: none;
-            border-radius: 8px;
-            font-size: 14px;
-            transition: background-color 0.3s ease;
+            cursor: pointer;
+            margin-top: 10px;
+            font-size: 1em;
         }
-
-        .back-button:hover {
-            opacity: 0.9;
-        }
-
-        th a {
-            color: var(--text-color);
-            text-decoration: none;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-
-        th a:hover {
-            color: var(--primary-color);
-        }
+        .action-button:hover { background-color: #218838; }
+        .action-button.clear-cache { background-color: #dc3545; }
+        .action-button.clear-cache:hover { background-color: #c82333; }
+        .status-ok { color: green; font-weight: bold; }
+        .status-error { color: red; font-weight: bold; }
+        .status-unavailable { color: orange; font-weight: bold; }
+        table { width: 100%; margin-top: 15px; border-collapse: collapse; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #dee2e6; }
+        th { background-color: #e9ecef; }
     </style>
 </head>
 <body>
+    <div class="header">
+        <h1>Cache Monitor & Management</h1>
+    </div>
+
     <div class="container">
-        
-        <a href="index.php" class="back-button">← Back to Dashboard</a>
-        
-        <h1 class="header" >Redis Cache Monitor - Tuesday Dashboard</h1>
-        
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-label">Total Tuesday Keys</div>
-                <div class="stat-value"><?php echo $totalTuesdayKeys; ?></div>
-                <div class="stat-label">of <?php echo $dbSize; ?> total keys</div>
-            </div>
-            
-            <div class="stat-card">
-                <div class="stat-label">Memory Usage</div>
-                <div class="stat-value"><?php echo $usedMemory; ?></div>
-                <div class="stat-label">Peak: <?php echo $usedMemoryPeak; ?></div>
-            </div>
-            
-            <div class="stat-card">
-                <div class="stat-label">Cache Hit Ratio</div>
-                <div class="stat-value"><?php echo $hitRatio; ?>%</div>
-                <div class="stat-label">Hits: <?php echo number_format($keyspaceHits); ?> / Misses: <?php echo number_format($keyspaceMisses); ?></div>
-                <div class="progress-container">
-                    <div class="progress-bar" style="width: <?php echo $hitRatio; ?>%"></div>
-                </div>
-            </div>
-            
-            <div class="stat-card">
-                <div class="stat-label">Redis Version</div>
-                <div class="stat-value"><?php echo $info['redis_version']; ?></div>
-                <div class="stat-label">Uptime: <?php echo round($info['uptime_in_seconds'] / 86400, 1); ?> days</div>
-            </div>
+        <div class="info-box">
+            <p>This page provides a basic interface for monitoring and managing the application's cache. Specific functionalities depend on the caching system implemented (e.g., APCu, Memcached, Redis, File-based).</p>
+            <p><strong class="status-error">Security Warning:</strong> Cache management operations can impact application performance and availability. Ensure this page is accessible only to authorized administrators.</p>
         </div>
-        
-        <div class="card">
-            <h2 class="card-header" >Tuesday Cache Keys</h2>
-            <table>
-                <thead>
-                    <tr>
-                        <th><a href="?sort=key&order=<?php echo $sortField === 'key' && $sortOrder === 'asc' ? 'desc' : 'asc'; ?>">Key <?php echo $sortField === 'key' ? ($sortOrder === 'asc' ? '▲' : '▼') : ''; ?></a></th>
-                        <th><a href="?sort=type&order=<?php echo $sortField === 'type' && $sortOrder === 'asc' ? 'desc' : 'asc'; ?>">Type <?php echo $sortField === 'type' ? ($sortOrder === 'asc' ? '▲' : '▼') : ''; ?></a></th>
-                        <th><a href="?sort=size&order=<?php echo $sortField === 'size' && $sortOrder === 'asc' ? 'desc' : 'asc'; ?>">Size <?php echo $sortField === 'size' ? ($sortOrder === 'asc' ? '▲' : '▼') : ''; ?></a></th>
-                        <th><a href="?sort=expires_in&order=<?php echo $sortField === 'expires_in' && $sortOrder === 'asc' ? 'desc' : 'asc'; ?>">Expires In <?php echo $sortField === 'expires_in' ? ($sortOrder === 'asc' ? '▲' : '▼') : ''; ?></a></th>
-                        <th><a href="?sort=created_at&order=<?php echo $sortField === 'created_at' && $sortOrder === 'asc' ? 'desc' : 'asc'; ?>">Created At <?php echo $sortField === 'created_at' ? ($sortOrder === 'asc' ? '▲' : '▼') : ''; ?></a></th>
-                        <th>Actions</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php foreach ($keyDetails as $key): ?>
-                    <tr>
-                        <td><?php echo htmlspecialchars($key['key']); ?></td>
-                        <td><?php echo $key['type']; ?></td>
-                        <td><?php echo $key['size']; ?></td>
-                        <td><?php echo $key['expires_in']; ?></td>
-                        <td><?php echo $key['created_at']; ?></td>
-                        <td>
-                            <form method="post" style="display: inline;">
-                                <input type="hidden" name="delete_key" value="<?php echo htmlspecialchars($key['key']); ?>">
-                                <button type="submit" class="btn btn-danger">Delete</button>
-                            </form>
-                        </td>
-                    </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
-        </div>
-        
-        <div class="actions">
-            <form method="post">
-                <input type="hidden" name="flush_tuesday" value="1">
-                <button type="submit" class="btn btn-danger">Flush Tuesday Cache</button>
-            </form>
-            
-            <form method="post">
-                <button type="submit" class="btn btn-primary">Refresh</button>
-            </form>
-        </div>
-        
-        <div class="refresh-time">
-            Last refreshed: <?php echo date('Y-m-d H:i:s'); ?>
-        </div>
+
+        <h2>General Cache Status</h2>
+        <p>No specific caching system is actively configured for detailed monitoring in this placeholder. The sections below provide examples of what could be displayed.</p>
+
+        <?php
+        // --- APCu Example (if available) ---
+        if (function_exists('apcu_cache_info') && function_exists('apcu_sma_info')) {
+            echo "<h2>APCu Cache</h2>";
+            if (isset($_GET['action']) && $_GET['action'] === 'clear_apcu_user') {
+                // Add a nonce here for CSRF protection in a real app
+                if (apcu_clear_cache()) { // Clears user cache
+                    echo "<p class='status-ok'>APCu user cache cleared successfully!</p>";
+                } else {
+                    echo "<p class='status-error'>Failed to clear APCu user cache.</p>";
+                }
+            }
+            if (isset($_GET['action']) && $_GET['action'] === 'clear_apcu_system') {
+                 // Clearing system cache (opcode) might not be available or advisable depending on PHP config
+                if (function_exists('opcache_reset') && opcache_reset()) { // opcache_reset() is for opcode cache
+                     echo "<p class='status-ok'>Opcode cache (if APCu is used for it) reset successfully!</p>";
+                } else if (apcu_clear_cache('system')) { // Attempt to clear system cache if distinct
+                     echo "<p class='status-ok'>APCu system cache cleared successfully!</p>";
+                }
+                else {
+                    echo "<p class='status-error'>Failed to clear APCu system/opcode cache or not supported.</p>";
+                }
+            }
+
+
+            $cacheInfo = apcu_cache_info();
+            $smaInfo = apcu_sma_info(true); // true for detailed segment info
+
+            echo "<table>";
+            echo "<tr><th>Metric</th><th>Value</th></tr>";
+            echo "<tr><td>APCu Version</td><td>" . (phpversion('apcu') ?: 'N/A') . "</td></tr>";
+            echo "<tr><td>Cached Files</td><td>" . htmlspecialchars($cacheInfo['num_entries'] ?? 'N/A') . "</td></tr>";
+            echo "<tr><td>Total Size</td><td>" . (isset($cacheInfo['mem_size']) ? round($cacheInfo['mem_size'] / 1024 / 1024, 2) . ' MB' : 'N/A') . "</td></tr>";
+            echo "<tr><td>Hits</td><td>" . htmlspecialchars($cacheInfo['num_hits'] ?? 'N/A') . "</td></tr>";
+            echo "<tr><td>Misses</td><td>" . htmlspecialchars($cacheInfo['num_misses'] ?? 'N/A') . "</td></tr>";
+            if (isset($cacheInfo['num_hits'], $cacheInfo['num_misses']) && ($cacheInfo['num_hits'] + $cacheInfo['num_misses']) > 0) {
+                $hitRate = ($cacheInfo['num_hits'] / ($cacheInfo['num_hits'] + $cacheInfo['num_misses'])) * 100;
+                echo "<tr><td>Hit Rate</td><td>" . round($hitRate, 2) . "%</td></tr>";
+            } else {
+                echo "<tr><td>Hit Rate</td><td>N/A</td></tr>";
+            }
+            echo "<tr><td>Available Memory (SMA)</td><td>" . (isset($smaInfo['avail_mem']) ? round($smaInfo['avail_mem'] / 1024 / 1024, 2) . ' MB' : 'N/A') . "</td></tr>";
+            echo "</table>";
+            echo "<a href='?action=clear_apcu_user' class='action-button clear-cache' onclick='return confirm(\"Are you sure you want to clear the APCu user cache?\");'>Clear APCu User Cache</a>";
+            // echo "<a href='?action=clear_apcu_system' class='action-button clear-cache' onclick='return confirm(\"Are you sure you want to clear the APCu system/opcode cache?\");'>Clear APCu System Cache</a>";
+        } else {
+            echo "<h2>APCu Cache</h2>";
+            echo "<p class='status-unavailable'>APCu extension is not installed or enabled on this server.</p>";
+        }
+        echo "<hr style='margin: 30px 0;'>";
+
+        // --- File-based Cache Example (conceptual) ---
+        echo "<h2>File-based Cache (Example)</h2>";
+        $exampleCacheDir = __DIR__ . '/_cache_data_files_'; // Example, use a proper configured path
+        // For security, this directory should ideally be outside the web root or protected by .htaccess
+
+        if (isset($_GET['action']) && $_GET['action'] === 'clear_file_cache') {
+            // Add nonce for CSRF protection
+            $clearedFiles = 0;
+            $failedFiles = 0;
+            if (is_dir($exampleCacheDir)) {
+                $files = glob($exampleCacheDir . '/*'); // get all file names
+                foreach($files as $file){ // iterate files
+                  if(is_file($file)) {
+                    if (unlink($file)) $clearedFiles++; else $failedFiles++;
+                  }
+                }
+                if ($failedFiles == 0) {
+                    echo "<p class='status-ok'>All file cache items cleared successfully ($clearedFiles files).</p>";
+                } else {
+                    echo "<p class='status-error'>Cleared $clearedFiles files, but failed to delete $failedFiles files.</p>";
+                }
+            } else {
+                 echo "<p class='status-unavailable'>Cache directory '<code>" . htmlspecialchars($exampleCacheDir) . "</code>' does not exist.</p>";
+            }
+        }
+
+        if (is_dir($exampleCacheDir)) {
+            $files = array_diff(scandir($exampleCacheDir), array('.', '..'));
+            $numCacheFiles = count($files);
+            $totalSize = 0;
+            foreach ($files as $file) {
+                $totalSize += filesize($exampleCacheDir . '/' . $file);
+            }
+            echo "<table>";
+            echo "<tr><th>Metric</th><th>Value</th></tr>";
+            echo "<tr><td>Cache Directory</td><td><code>" . htmlspecialchars($exampleCacheDir) . "</code></td></tr>";
+            echo "<tr><td>Number of Cached Files</td><td>" . $numCacheFiles . "</td></tr>";
+            echo "<tr><td>Total Size</td><td>" . round($totalSize / 1024, 2) . " KB</td></tr>";
+            echo "</table>";
+            if ($numCacheFiles > 0) {
+                echo "<a href='?action=clear_file_cache' class='action-button clear-cache' onclick='return confirm(\"Are you sure you want to clear all file-based cache items?\");'>Clear File Cache</a>";
+            }
+        } else {
+            echo "<p class='status-unavailable'>Example file cache directory ('<code>" . htmlspecialchars($exampleCacheDir) . "</code>') not found. You might need to create it.</p>";
+            // echo "<button onclick=\"document.location.href='?action=create_cache_dir'\">Try to Create Cache Directory</button>"; // Example
+        }
+        // if (isset($_GET['action']) && $_GET['action'] === 'create_cache_dir') {
+        //     if (!is_dir($exampleCacheDir)) {
+        //         if (mkdir($exampleCacheDir, 0755, true)) {
+        //             echo "<p class='status-ok'>Cache directory created. Refresh to see status.</p>";
+        //         } else {
+        //             echo "<p class='status-error'>Failed to create cache directory.</p>";
+        //         }
+        //     }
+        // }
+
+
+        echo "<h2>Further Information</h2>";
+        echo "<div class='code-block'>";
+        echo "<strong>Notes:</strong>\n";
+        echo "- This is a basic monitoring page. For production, enhance security and error handling.\n";
+        echo "- Actual cache statistics and management options depend heavily on the chosen caching solution (Redis, Memcached, etc.).\n";
+        echo "- For Redis/Memcached, you'd use their respective PHP extensions to connect and fetch stats (e.g., `\$redis->info()`, `\$memcached->getStats()`).";
+        echo "</div>";
+        ?>
     </div>
 </body>
 </html>

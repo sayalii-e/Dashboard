@@ -1,708 +1,300 @@
 <?php
-// Database connection details
-$host = 'localhost';
-$dbname = 'xx';  // Database name updated
-$username = 'xx';
-$password = 'xxx';
 
-// Redis configuration
-$redisHost = 'localhost';
-$redisPort = 6379;
-$redisPassword = null; // Set this if your Redis server requires authentication
-$redisTimeout = 2.5;
-$redisExpiry = 2592000; // Cache expiry in seconds (30 days)
+// --- Database Configuration ---
+// IMPORTANT: Replace with your actual database credentials
+$dbHost = 'localhost';
+$dbUser = 'root';      // Default XAMPP/MAMP username
+$dbPass = '';          // Default XAMPP/MAMP password (often empty)
+$dbName = 'placement_dashboard'; // The database name you created
 
-// Initialize Redis connection
-$redis = null;
-try {
-    $redis = new Redis();
-    $connected = $redis->connect($redisHost, $redisPort, $redisTimeout);
-    if ($connected && $redisPassword) {
-        $redis->auth($redisPassword);
+// --- Helper Functions ---
+
+/**
+ * Establishes a database connection.
+ * @return mysqli|false Connection object or false on failure.
+ */
+function getDbConnection() {
+    global $dbHost, $dbUser, $dbPass, $dbName;
+
+    // Check if .env file exists for credentials
+    $envFile = __DIR__ . '/.env';
+    if (file_exists($envFile)) {
+        $env = parse_ini_file($envFile);
+        $dbHost = $env['DB_HOST'] ?? $dbHost;
+        $dbUser = $env['DB_USER'] ?? $dbUser;
+        $dbPass = $env['DB_PASS'] ?? $dbPass;
+        $dbName = $env['DB_NAME'] ?? $dbName;
     }
-    if (!$connected) {
-        error_log("Redis connection failed");
-        $redis = null;
+
+    $conn = new mysqli($dbHost, $dbUser, $dbPass, $dbName);
+    if ($conn->connect_error) {
+        error_log("Database Connection Failed: " . $conn->connect_error);
+        // Do not output connection error directly to client for security reasons in production
+        return false;
     }
-} catch (Exception $e) {
-    error_log("Redis error: " . $e->getMessage());
-    $redis = null;
+    $conn->set_charset("utf8mb4");
+    return $conn;
 }
 
-// Create connection
-$conn = new mysqli($host, $username, $password, $dbname);
+/**
+ * Builds the WHERE clause for SQL query based on filters.
+ * Uses prepared statements to prevent SQL injection.
+ * @param mysqli $conn The database connection object.
+ * @param array $params The GET request parameters.
+ * @param array &$bindParams Array to store parameters for binding.
+ * @param string &$bindTypes String to store types for binding.
+ * @return string The WHERE clause string (e.g., " WHERE `col` LIKE ? AND `col2` = ?").
+ */
+function buildWhereClauseSecure($conn, $params, &$bindParams, &$bindTypes) {
+    $whereConditions = [];
+    $filterMappings = [
+        // paramKey from JS => dbColumn
+        'company_name' => 'company',
+        'name' => 'name',
+        'website' => 'website',
+        'email' => 'email',
+        'mobile' => 'mobile',
+        'address' => 'address'
+    ];
 
-// Check for connection error
-if ($conn->connect_error) {
-    die(json_encode(array("error" => "Connection failed: " . $conn->connect_error), JSON_UNESCAPED_UNICODE));
-}
+    foreach ($filterMappings as $paramKey => $dbColumn) {
+        if (!empty($params[$paramKey])) {
+            $value = $params[$paramKey]; // Raw value, will be bound
+            $type = isset($params[$paramKey . '_type']) ? $params[$paramKey . '_type'] : 'contains';
 
-// Set the charset to UTF-8 (important for handling special characters)
-$conn->set_charset("utf8mb4"); 
-
-// Get action parameter (export or normal request)
-$action = isset($_GET['action']) ? $_GET['action'] : (isset($_POST['action']) ? $_POST['action'] : '');
-
-// Function to sanitize the filename (removes unwanted characters)
-function sanitizeFileName($string) {
-    return preg_replace('/[^a-zA-Z0-9-_\.]/', '_', $string);
-}
-
-// Function to apply filter based on operator
-function applyFilter($field, $value, $operator = 'contains') {
-    global $conn;
-    $value = $conn->real_escape_string($value);
-    
-    switch ($operator) {
-        case 'starts_with':
-            return "`$field` LIKE '$value%'";
-        case 'include':
-            // Include matches exact sequence
-            return "`$field` LIKE '%$value%'";
-        case 'exclude':
-            // Exclude matches if sequence does not appear
-            return "`$field` NOT LIKE '%$value%'";
-        case 'contains':
-        default:
-            return "`$field` LIKE '%$value%'";
-    }
-}
-
-// Function to generate a cache key based on request parameters
-function generateCacheKey($params) {
-    // Sort parameters to ensure consistent cache keys
-    ksort($params);
-    return 'tuesday_' . md5(json_encode($params));
-}
-
-// Get unique countries
-if ($action === 'getCountries') {
-    $cacheKey = 'tuesday_countries';
-    $countries = [];
-    
-    // Try to get from cache first
-    if ($redis && $redis->exists($cacheKey)) {
-        $countries = json_decode($redis->get($cacheKey), true);
-        echo json_encode(['success' => true, 'countries' => $countries, 'cached' => true]);
-        exit;
-    }
-    
-    $sql = "SELECT DISTINCT account_country FROM data WHERE account_country IS NOT NULL AND account_country != '' ORDER BY account_country";
-    $result = $conn->query($sql);
-    
-    if ($result) {
-        while ($row = $result->fetch_assoc()) {
-            $countries[] = $row['account_country'];
+            switch ($type) {
+                case 'startsWith':
+                    $whereConditions[] = "`" . $dbColumn . "` LIKE ?";
+                    $bindParams[] = $value . "%";
+                    $bindTypes .= "s";
+                    break;
+                case 'includes':
+                case 'contains':
+                    $whereConditions[] = "`" . $dbColumn . "` LIKE ?";
+                    $bindParams[] = "%" . $value . "%";
+                    $bindTypes .= "s";
+                    break;
+                case 'excludes':
+                    $whereConditions[] = "`" . $dbColumn . "` NOT LIKE ?";
+                    $bindParams[] = "%" . $value . "%"; // For NOT LIKE, %value% is common
+                    $bindTypes .= "s";
+                    break;
+            }
         }
-        
-        // Store in cache
-        if ($redis) {
-            $redis->set($cacheKey, json_encode($countries));
-            $redis->expire($cacheKey, $redisExpiry);
-        }
-        
-        echo json_encode(['success' => true, 'countries' => $countries, 'cached' => false]);
-    } else {
-        echo json_encode(['success' => false, 'error' => $conn->error]);
     }
-    exit;
+
+    // City filter (direct match)
+    if (!empty($params['city'])) {
+        $whereConditions[] = "`city` = ?";
+        $bindParams[] = $params['city'];
+        $bindTypes .= "s";
+    }
+
+    return count($whereConditions) > 0 ? " WHERE " . implode(" AND ", $whereConditions) : "";
 }
 
-// Get unique cities
-if ($action === 'getCities') {
-    $cacheKey = 'tuesday_cities';
+
+/**
+ * Fetches distinct city names from the database.
+ * @param mysqli $conn Database connection object.
+ */
+function getCities($conn) {
+    $sql = "SELECT DISTINCT `city` FROM `data` WHERE `city` IS NOT NULL AND `city` != '' ORDER BY `city` ASC";
+    $result = $conn->query($sql); // Simple query, no user input, direct query is fine
     $cities = [];
-    
-    // Try to get from cache first
-    if ($redis && $redis->exists($cacheKey)) {
-        $cities = json_decode($redis->get($cacheKey), true);
-        echo json_encode(['success' => true, 'cities' => $cities, 'cached' => true]);
-        exit;
-    }
-    
-    $sql = "SELECT DISTINCT account_city FROM data WHERE account_city IS NOT NULL AND account_city != '' ORDER BY account_city";
-    $result = $conn->query($sql);
-    
     if ($result) {
         while ($row = $result->fetch_assoc()) {
-            $cities[] = $row['account_city'];
+            $cities[] = $row['city'];
         }
-        
-        // Store in cache
-        if ($redis) {
-            $redis->set($cacheKey, json_encode($cities));
-            $redis->expire($cacheKey, $redisExpiry);
-        }
-        
-        echo json_encode(['success' => true, 'cities' => $cities, 'cached' => false]);
+        $result->free();
+        echo json_encode(['cities' => $cities]);
     } else {
-        echo json_encode(['success' => false, 'error' => $conn->error]);
+        // Log the detailed error, provide a generic one to the client
+        error_log("Failed to fetch cities: " . $conn->error);
+        echo json_encode(['error' => 'Failed to retrieve city list.']);
     }
-    exit;
 }
 
-// Check if CSV export is requested
-if ($action === 'exportToCSV') {
-    // Get filter values from request
-    $searchValue = isset($_GET['searchValue']) ? $_GET['searchValue'] : "";
+/**
+ * Fetches data based on filters using prepared statements.
+ * @param mysqli $conn Database connection object.
+ * @param array $params GET request parameters.
+ */
+function getData($conn, $params) {
+    $bindParams = [];
+    $bindTypes = "";
+    $whereClause = buildWhereClauseSecure($conn, $params, $bindParams, $bindTypes);
     
-    // Account Name filters
-    $accountNameContains = isset($_GET['accountNameContains']) ? $_GET['accountNameContains'] : "";
-    $accountNameStartsWith = isset($_GET['accountNameStartsWith']) ? $_GET['accountNameStartsWith'] : "";
-    $accountNameIncludes = isset($_GET['accountNameIncludes']) ? $_GET['accountNameIncludes'] : "";
-    $accountNameExcludes = isset($_GET['accountNameExcludes']) ? $_GET['accountNameExcludes'] : "";
+    $sql = "SELECT `company`, `name`, `mobile`, `email`, `city`, `address`, `pincode`, `website`, `category`, `State` FROM `data`" . $whereClause . " ORDER BY `company` ASC, `name` ASC";
     
-    // Website filters
-    $accountWebsiteContains = isset($_GET['accountWebsiteContains']) ? $_GET['accountWebsiteContains'] : "";
-    $accountWebsiteStartsWith = isset($_GET['accountWebsiteStartsWith']) ? $_GET['accountWebsiteStartsWith'] : "";
-    $accountWebsiteIncludes = isset($_GET['accountWebsiteIncludes']) ? $_GET['accountWebsiteIncludes'] : "";
-    $accountWebsiteExcludes = isset($_GET['accountWebsiteExcludes']) ? $_GET['accountWebsiteExcludes'] : "";
-    
-    // Industry filters
-    $accountIndustryContains = isset($_GET['accountIndustryContains']) ? $_GET['accountIndustryContains'] : "";
-    $accountIndustryStartsWith = isset($_GET['accountIndustryStartsWith']) ? $_GET['accountIndustryStartsWith'] : "";
-    $accountIndustryIncludes = isset($_GET['accountIndustryIncludes']) ? $_GET['accountIndustryIncludes'] : "";
-    $accountIndustryExcludes = isset($_GET['accountIndustryExcludes']) ? $_GET['accountIndustryExcludes'] : "";
-    
-    // Employee Count filters
-    $accountEmployeeCountContains = isset($_GET['accountEmployeeCountContains']) ? $_GET['accountEmployeeCountContains'] : "";
-    $accountEmployeeCountStartsWith = isset($_GET['accountEmployeeCountStartsWith']) ? $_GET['accountEmployeeCountStartsWith'] : "";
-    $accountEmployeeCountIncludes = isset($_GET['accountEmployeeCountIncludes']) ? $_GET['accountEmployeeCountIncludes'] : "";
-    $accountEmployeeCountExcludes = isset($_GET['accountEmployeeCountExcludes']) ? $_GET['accountEmployeeCountExcludes'] : "";
-    
-    // Founded Year filter
-    $accountFoundedYear = isset($_GET['accountFoundedYear']) ? $_GET['accountFoundedYear'] : "";
-    
-    // Country filter
-    $country = isset($_GET['country']) ? json_decode($_GET['country'], true) : [];
-    
-    // City filter
-    $city = isset($_GET['city']) ? json_decode($_GET['city'], true) : [];
+    $stmt = $conn->prepare($sql);
+    if (!$stmt) {
+        error_log("Prepare failed for getData: (" . $conn->errno . ") " . $conn->error . " SQL: " . $sql);
+        echo json_encode(['error' => 'An error occurred while preparing data.']);
+        return;
+    }
 
-    // Apply limit if exportLimit is set
-    $exportLimit = isset($_GET['limit']) && $_GET['limit'] !== '' ? (int)$_GET['limit'] : null;
+    if (!empty($bindTypes) && !empty($bindParams)) {
+        // The splat operator (...) unpacks the $bindParams array into individual arguments
+        if (!$stmt->bind_param($bindTypes, ...$bindParams)) {
+            error_log("Binding parameters failed for getData: (" . $stmt->errno . ") " . $stmt->error);
+            echo json_encode(['error' => 'An error occurred while binding parameters.']);
+            $stmt->close();
+            return;
+        }
+    }
+    
+    if (!$stmt->execute()) {
+        error_log("Execute failed for getData: (" . $stmt->errno . ") " . $stmt->error);
+        echo json_encode(['error' => 'An error occurred while fetching data.']);
+        $stmt->close();
+        return;
+    }
 
-    // Prepare selected columns
-    $selectedColumns = isset($_GET['columns']) ? $_GET['columns'] : '';
-
-    // Escape the filter values to prevent SQL injection
-    $searchValue = $conn->real_escape_string($searchValue);
-    
-    $accountNameContains = $conn->real_escape_string($accountNameContains);
-    $accountNameStartsWith = $conn->real_escape_string($accountNameStartsWith);
-    $accountNameIncludes = $conn->real_escape_string($accountNameIncludes);
-    $accountNameExcludes = $conn->real_escape_string($accountNameExcludes);
-    
-    $accountWebsiteContains = $conn->real_escape_string($accountWebsiteContains);
-    $accountWebsiteStartsWith = $conn->real_escape_string($accountWebsiteStartsWith);
-    $accountWebsiteIncludes = $conn->real_escape_string($accountWebsiteIncludes);
-    $accountWebsiteExcludes = $conn->real_escape_string($accountWebsiteExcludes);
-    
-    $accountIndustryContains = $conn->real_escape_string($accountIndustryContains);
-    $accountIndustryStartsWith = $conn->real_escape_string($accountIndustryStartsWith);
-    $accountIndustryIncludes = $conn->real_escape_string($accountIndustryIncludes);
-    $accountIndustryExcludes = $conn->real_escape_string($accountIndustryExcludes);
-    
-    $accountEmployeeCountContains = $conn->real_escape_string($accountEmployeeCountContains);
-    $accountEmployeeCountStartsWith = $conn->real_escape_string($accountEmployeeCountStartsWith);
-    $accountEmployeeCountIncludes = $conn->real_escape_string($accountEmployeeCountIncludes);
-    $accountEmployeeCountExcludes = $conn->real_escape_string($accountEmployeeCountExcludes);
-    
-    $accountFoundedYear = $conn->real_escape_string($accountFoundedYear);
-
-    // Default columns if none selected
-    if (!empty($selectedColumns)) {
-        $columnsArray = explode(',', $selectedColumns);
-        $columnsToSelect = array_map(function($col) {
-            return "`" . trim($col) . "`"; // Wrap each column name in backticks
-        }, $columnsArray);
-        $columnsToSelect = implode(', ', $columnsToSelect);
+    $result = $stmt->get_result();
+    $data = [];
+    if ($result) {
+        while ($row = $result->fetch_assoc()) {
+            $data[] = $row;
+        }
+        $result->free();
     } else {
-        // Default columns to export all
-        $columnsToSelect = '*';
+        error_log("Getting result set failed for getData: (" . $stmt->errno . ") " . $stmt->error);
+        echo json_encode(['error' => 'Failed to retrieve results.']);
+        $stmt->close();
+        return;
     }
- 
-    // Get start and end rows
-    $startRow = isset($_GET['startRow']) ? (int)$_GET['startRow'] : 0;
-    $endRow = isset($_GET['endRow']) ? (int)$_GET['endRow'] : 0;
-
-    // Generate cache key for export
-    $exportParams = array_merge($_GET, ['action' => 'exportToCSV']);
-    $cacheKey = 'tuesday_export_' . md5(json_encode($exportParams));
     
-    // For exports, we'll only cache the SQL query, not the actual CSV data
-    $sql = null;
-    if ($redis && $redis->exists($cacheKey)) {
-        $sql = $redis->get($cacheKey);
-    } else {
-        // Construct the SQL query for fetching the data with proper filter conditions
-        $sql = "SELECT $columnsToSelect FROM data WHERE 1=1";
+    $stmt->close();
+    echo json_encode(['data' => $data]);
+}
 
-        // Apply global search filter
-        if (!empty($searchValue)) {
-            // Multiple field search
-            $sql .= " AND (";
-            $sql .= applyFilter('account_name', $searchValue, 'contains');
-            $sql .= " OR " . applyFilter('account_website', $searchValue, 'contains');
-            $sql .= " OR " . applyFilter('account_industry', $searchValue, 'contains');
-            $sql .= ")";
-        }
-        
-        // Apply Account Name filters
-        if (!empty($accountNameContains)) {
-            $sql .= " AND " . applyFilter('account_name', $accountNameContains, 'contains');
-        }
-        if (!empty($accountNameStartsWith)) {
-            $sql .= " AND " . applyFilter('account_name', $accountNameStartsWith, 'starts_with');
-        }
-        if (!empty($accountNameIncludes)) {
-            $sql .= " AND " . applyFilter('account_name', $accountNameIncludes, 'include');
-        }
-        if (!empty($accountNameExcludes)) {
-            $sql .= " AND " . applyFilter('account_name', $accountNameExcludes, 'exclude');
-        }
-        
-        // Apply Website filters
-        if (!empty($accountWebsiteContains)) {
-            $sql .= " AND " . applyFilter('account_website', $accountWebsiteContains, 'contains');
-        }
-        if (!empty($accountWebsiteStartsWith)) {
-            $sql .= " AND " . applyFilter('account_website', $accountWebsiteStartsWith, 'starts_with');
-        }
-        if (!empty($accountWebsiteIncludes)) {
-            $sql .= " AND " . applyFilter('account_website', $accountWebsiteIncludes, 'include');
-        }
-        if (!empty($accountWebsiteExcludes)) {
-            $sql .= " AND " . applyFilter('account_website', $accountWebsiteExcludes, 'exclude');
-        }
-        
-        // Apply Industry filters
-        if (!empty($accountIndustryContains)) {
-            $sql .= " AND " . applyFilter('account_industry', $accountIndustryContains, 'contains');
-        }
-        if (!empty($accountIndustryStartsWith)) {
-            $sql .= " AND " . applyFilter('account_industry', $accountIndustryStartsWith, 'starts_with');
-        }
-        if (!empty($accountIndustryIncludes)) {
-            $sql .= " AND " . applyFilter('account_industry', $accountIndustryIncludes, 'include');
-        }
-        if (!empty($accountIndustryExcludes)) {
-            $sql .= " AND " . applyFilter('account_industry', $accountIndustryExcludes, 'exclude');
-        }
-        
-        // Apply Employee Count filters
-        if (!empty($accountEmployeeCountContains)) {
-            $sql .= " AND " . applyFilter('account_employee_count_range', $accountEmployeeCountContains, 'contains');
-        }
-        if (!empty($accountEmployeeCountStartsWith)) {
-            $sql .= " AND " . applyFilter('account_employee_count_range', $accountEmployeeCountStartsWith, 'starts_with');
-        }
-        if (!empty($accountEmployeeCountIncludes)) {
-            $sql .= " AND " . applyFilter('account_employee_count_range', $accountEmployeeCountIncludes, 'include');
-        }
-        if (!empty($accountEmployeeCountExcludes)) {
-            $sql .= " AND " . applyFilter('account_employee_count_range', $accountEmployeeCountExcludes, 'exclude');
-        }
-        
-        // Apply Founded Year filter
-        if (!empty($accountFoundedYear)) {
-            $sql .= " AND `account_founded_year` = '$accountFoundedYear'";
-        }
-        
-        // Apply Country filter
-        if (!empty($country)) {
-            $countryConditions = [];
-            foreach ($country as $c) {
-                $escapedCountry = $conn->real_escape_string($c);
-                $countryConditions[] = "`account_country` = '$escapedCountry'";
-            }
-            if (!empty($countryConditions)) {
-                $sql .= " AND (" . implode(" OR ", $countryConditions) . ")";
-            }
-        }
-        
-        // Apply City filter
-        if (!empty($city)) {
-            $cityConditions = [];
-            foreach ($city as $c) {
-                $escapedCity = $conn->real_escape_string($c);
-                $cityConditions[] = "`account_city` = '$escapedCity'";
-            }
-            if (!empty($cityConditions)) {
-                $sql .= " AND (" . implode(" OR ", $cityConditions) . ")";
-            }
-        }
-        
-        // Apply row offset if startRow and endRow are set
-        if ($startRow > 0 && $endRow > 0) {
-            $sql .= " LIMIT " . ($startRow - 1) . ", " . ($endRow - $startRow + 1);
-        }
-        // Apply export limit if provided
-        if ($exportLimit !== null) {
-            $sql .= " LIMIT $exportLimit"; // Apply the export limit if provided
-        }
-        
-        // Cache the SQL query for future exports with the same parameters
-        if ($redis) {
-            $redis->set($cacheKey, $sql);
-            $redis->expire($cacheKey, $redisExpiry);
+
+/**
+ * Exports data to CSV format using prepared statements.
+ * @param mysqli $conn Database connection object.
+ * @param array $params GET request parameters.
+ */
+function exportCsv($conn, $params) {
+    $bindParams = [];
+    $bindTypes = "";
+    $whereClause = buildWhereClauseSecure($conn, $params, $bindParams, $bindTypes);
+    
+    // Select all columns as per "Export Columns : All columns select option"
+    $sql = "SELECT `company`, `name`, `mobile`, `email`, `address`, `pincode`, `city`, `website`, `category`, `State` FROM `data`" . $whereClause . " ORDER BY `company` ASC, `name` ASC";
+
+    $stmt = $conn->prepare($sql);
+
+    if (!$stmt) {
+        header('Content-Type: text/plain');
+        error_log("Prepare failed for exportCsv: (" . $conn->errno . ") " . $conn->error . " SQL: " . $sql);
+        echo "Error preparing CSV data.";
+        return;
+    }
+
+    if (!empty($bindTypes) && !empty($bindParams)) {
+        if (!$stmt->bind_param($bindTypes, ...$bindParams)) {
+            header('Content-Type: text/plain');
+            error_log("Binding parameters failed for exportCsv: (" . $stmt->errno . ") " . $stmt->error);
+            echo "Error binding parameters for CSV.";
+            $stmt->close();
+            return;
         }
     }
 
-    // Execute the query
-    $result = $conn->query($sql);
-
-    // Check if the query was successful
-    if ($result === false) {
-        die('Query failed: ' . $conn->error);
+    if (!$stmt->execute()) {
+        header('Content-Type: text/plain');
+        error_log("Execute failed for exportCsv: (" . $stmt->errno . ") " . $stmt->error);
+        echo "Error executing query for CSV.";
+        $stmt->close();
+        return;
     }
 
-    // Generate dynamic file name based on filters
-    $fileName = 'Tuesday_Export_';
-    $filtersApplied = false; // Track if any filter is applied
+    $result = $stmt->get_result();
 
-    // Check if each filter is applied, and append to the file name if so
-    if (!empty($searchValue)) {
-        $fileName .= 'Search_';
-        $filtersApplied = true;
-    }
-
-    if (!empty($accountNameContains) || !empty($accountNameStartsWith) || !empty($accountNameIncludes) || !empty($accountNameExcludes)) {
-        $fileName .= 'AccountName_';
-        $filtersApplied = true;
-    }
-    if (!empty($accountWebsiteContains) || !empty($accountWebsiteStartsWith) || !empty($accountWebsiteIncludes) || !empty($accountWebsiteExcludes)) {
-        $fileName .= 'Website_';
-        $filtersApplied = true;
-    }
-    if (!empty($accountIndustryContains) || !empty($accountIndustryStartsWith) || !empty($accountIndustryIncludes) || !empty($accountIndustryExcludes)) {
-        $fileName .= 'Industry_';
-        $filtersApplied = true;
-    }
-    if (!empty($accountEmployeeCountContains) || !empty($accountEmployeeCountStartsWith) || !empty($accountEmployeeCountIncludes) || !empty($accountEmployeeCountExcludes)) {
-        $fileName .= 'EmployeeCount_';
-        $filtersApplied = true;
-    }
-    if (!empty($accountFoundedYear)) {
-        $fileName .= 'FoundedYear_';
-        $filtersApplied = true;
-    }
-    if (!empty($country)) {
-        $fileName .= 'Country_';
-        $filtersApplied = true;
-    }
-    if (!empty($city)) {
-        $fileName .= 'City_';
-        $filtersApplied = true;
+    if (!$result) {
+        header('Content-Type: text/plain');
+        error_log("Getting result set failed for exportCsv: (" . $stmt->errno . ") " . $stmt->error);
+        echo "Error retrieving data for CSV.";
+        $stmt->close();
+        return;
     }
 
-    // If no filters were applied, use a default name
-    if (!$filtersApplied) {
-        $fileName .= 'All_Records_';
-    }
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="placement_data_' . date('Y-m-d_H-i-s') . '.csv"');
 
-    // Add date for uniqueness
-    $fileName .= date('Y-m-d_H-i-s') . '.csv';
-
-    // Ensure the filename doesn't contain any unwanted characters
-    $fileName = sanitizeFileName($fileName);
-
-    // Open the output stream for CSV
-    header('Content-Type: text/csv');
-    header('Content-Disposition: attachment; filename="' . $fileName . '"');
     $output = fopen('php://output', 'w');
 
-    // Fetch column names from the result and write them as header
-    $columns = $result->fetch_fields();
-    $header = [];
-    foreach ($columns as $column) {
-        $header[] = $column->name;
-    }
-    fputcsv($output, $header);
+    // Add headers
+    fputcsv($output, ['Company', 'Name', 'Mobile', 'Email', 'Address', 'Pincode', 'City', 'Website', 'Category', 'State']);
 
-    // Fetch and write the data rows
     while ($row = $result->fetch_assoc()) {
         fputcsv($output, $row);
     }
 
-    // Close the output stream and database connection
     fclose($output);
-    $conn->close();
-    exit;  // Terminate script to prevent further output
+    $result->free();
+    $stmt->close();
 }
 
-// Get the filter values from the request
-$searchValue = isset($_POST['searchValue']) ? $_POST['searchValue'] : '';
 
-// Account Name filters
-$accountNameContains = isset($_POST['accountNameContains']) ? $_POST['accountNameContains'] : '';
-$accountNameStartsWith = isset($_POST['accountNameStartsWith']) ? $_POST['accountNameStartsWith'] : '';
-$accountNameIncludes = isset($_POST['accountNameIncludes']) ? $_POST['accountNameIncludes'] : '';
-$accountNameExcludes = isset($_POST['accountNameExcludes']) ? $_POST['accountNameExcludes'] : '';
+// --- Main Controller ---
+$action = isset($_GET['action']) ? $_GET['action'] : '';
 
-// Website filters
-$accountWebsiteContains = isset($_POST['accountWebsiteContains']) ? $_POST['accountWebsiteContains'] : '';
-$accountWebsiteStartsWith = isset($_POST['accountWebsiteStartsWith']) ? $_POST['accountWebsiteStartsWith'] : '';
-$accountWebsiteIncludes = isset($_POST['accountWebsiteIncludes']) ? $_POST['accountWebsiteIncludes'] : '';
-$accountWebsiteExcludes = isset($_POST['accountWebsiteExcludes']) ? $_POST['accountWebsiteExcludes'] : '';
-
-// Industry filters
-$accountIndustryContains = isset($_POST['accountIndustryContains']) ? $_POST['accountIndustryContains'] : '';
-$accountIndustryStartsWith = isset($_POST['accountIndustryStartsWith']) ? $_POST['accountIndustryStartsWith'] : '';
-$accountIndustryIncludes = isset($_POST['accountIndustryIncludes']) ? $_POST['accountIndustryIncludes'] : '';
-$accountIndustryExcludes = isset($_POST['accountIndustryExcludes']) ? $_POST['accountIndustryExcludes'] : '';
-
-// Employee Count filters
-$accountEmployeeCountContains = isset($_POST['accountEmployeeCountContains']) ? $_POST['accountEmployeeCountContains'] : '';
-$accountEmployeeCountStartsWith = isset($_POST['accountEmployeeCountStartsWith']) ? $_POST['accountEmployeeCountStartsWith'] : '';
-$accountEmployeeCountIncludes = isset($_POST['accountEmployeeCountIncludes']) ? $_POST['accountEmployeeCountIncludes'] : '';
-$accountEmployeeCountExcludes = isset($_POST['accountEmployeeCountExcludes']) ? $_POST['accountEmployeeCountExcludes'] : '';
-
-// Founded Year filter
-$accountFoundedYear = isset($_POST['accountFoundedYear']) ? $_POST['accountFoundedYear'] : '';
-
-// Country filter
-$country = isset($_POST['country']) ? $_POST['country'] : [];
-
-// City filter
-$city = isset($_POST['city']) ? $_POST['city'] : [];
-
-// Get the page number and limit from the AJAX request (default to 1 and 10 if not provided)
-$page = isset($_POST['page']) ? (int)$_POST['page'] : 1;
-$limit = isset($_POST['limit']) ? (int)$_POST['limit'] : 10;
-
-// Calculate the offset for the query
-$offset = ($page - 1) * $limit;
-
-// Generate cache key for this query
-$cacheKey = generateCacheKey(array_merge($_POST, ['query' => 'main_data']));
-
-// Try to get data from cache first
-$cachedData = null;
-if ($redis && $redis->exists($cacheKey)) {
-    $cachedData = json_decode($redis->get($cacheKey), true);
+if (empty($action)) {
+    if (isset($_POST['action'])) { // Also check POST for action, though GET is typical for this setup
+        $action = $_POST['action'];
+    } else {
+        header('Content-Type: application/json');
+        echo json_encode(['error' => 'No action specified.']);
+        exit;
+    }
 }
 
-if ($cachedData !== null) {
-    // Use cached data
-    header('Content-Type: application/json');
-    echo json_encode($cachedData);
+
+$conn = getDbConnection();
+if (!$conn) {
+    // For AJAX requests, return JSON error.
+    // For CSV, a plain text error is more appropriate if headers haven't been sent.
+    if ($action !== 'exportCsv') {
+         header('Content-Type: application/json');
+    } else {
+         header('Content-Type: text/plain');
+    }
+    // Provide a generic error to the client, log the specific one.
+    echo json_encode(['error' => 'Database connection error. Please contact an administrator.']);
     exit;
 }
 
-// Escape all inputs
-$searchValue = $conn->real_escape_string($searchValue);
-
-$accountNameContains = $conn->real_escape_string($accountNameContains);
-$accountNameStartsWith = $conn->real_escape_string($accountNameStartsWith);
-$accountNameIncludes = $conn->real_escape_string($accountNameIncludes);
-$accountNameExcludes = $conn->real_escape_string($accountNameExcludes);
-
-$accountWebsiteContains = $conn->real_escape_string($accountWebsiteContains);
-$accountWebsiteStartsWith = $conn->real_escape_string($accountWebsiteStartsWith);
-$accountWebsiteIncludes = $conn->real_escape_string($accountWebsiteIncludes);
-$accountWebsiteExcludes = $conn->real_escape_string($accountWebsiteExcludes);
-
-$accountIndustryContains = $conn->real_escape_string($accountIndustryContains);
-$accountIndustryStartsWith = $conn->real_escape_string($accountIndustryStartsWith);
-$accountIndustryIncludes = $conn->real_escape_string($accountIndustryIncludes);
-$accountIndustryExcludes = $conn->real_escape_string($accountIndustryExcludes);
-
-$accountEmployeeCountContains = $conn->real_escape_string($accountEmployeeCountContains);
-$accountEmployeeCountStartsWith = $conn->real_escape_string($accountEmployeeCountStartsWith);
-$accountEmployeeCountIncludes = $conn->real_escape_string($accountEmployeeCountIncludes);
-$accountEmployeeCountExcludes = $conn->real_escape_string($accountEmployeeCountExcludes);
-
-$accountFoundedYear = $conn->real_escape_string($accountFoundedYear);
-
-// Construct main SQL query
-$sql = "SELECT * FROM data WHERE 1=1";
-
-// Apply global search filter
-if (!empty($searchValue)) {
-    // Search across multiple fields
-    $sql .= " AND (";
-    $sql .= applyFilter('account_name', $searchValue, 'contains');
-    $sql .= " OR " . applyFilter('account_website', $searchValue, 'contains');
-    $sql .= " OR " . applyFilter('account_industry', $searchValue, 'contains');
-    $sql .= ")";
+// Set default content type for JSON responses, can be overridden by exportCsv
+if ($action !== 'exportCsv') {
+    header('Content-Type: application/json');
 }
 
-// Apply Account Name filters
-if (!empty($accountNameContains)) {
-    $sql .= " AND " . applyFilter('account_name', $accountNameContains, 'contains');
-}
-if (!empty($accountNameStartsWith)) {
-    $sql .= " AND " . applyFilter('account_name', $accountNameStartsWith, 'starts_with');
-}
-if (!empty($accountNameIncludes)) {
-    $sql .= " AND " . applyFilter('account_name', $accountNameIncludes, 'include');
-}
-if (!empty($accountNameExcludes)) {
-    $sql .= " AND " . applyFilter('account_name', $accountNameExcludes, 'exclude');
+
+switch ($action) {
+    case 'getCities':
+        getCities($conn);
+        break;
+    case 'getData':
+        // Use $_GET for getData as per JavaScript fetch call
+        getData($conn, $_GET);
+        break;
+    case 'exportCsv':
+        // Use $_GET for exportCsv as per JavaScript window.location.href
+        exportCsv($conn, $_GET);
+        break;
+    default:
+        if ($action !== 'exportCsv') { // Avoid sending JSON if it was an export attempt with bad action
+            echo json_encode(['error' => 'Invalid action specified.']);
+        } else {
+            header('Content-Type: text/plain');
+            echo 'Invalid action for export.';
+        }
 }
 
-// Apply Website filters
-if (!empty($accountWebsiteContains)) {
-    $sql .= " AND " . applyFilter('account_website', $accountWebsiteContains, 'contains');
-}
-if (!empty($accountWebsiteStartsWith)) {
-    $sql .= " AND " . applyFilter('account_website', $accountWebsiteStartsWith, 'starts_with');
-}
-if (!empty($accountWebsiteIncludes)) {
-    $sql .= " AND " . applyFilter('account_website', $accountWebsiteIncludes, 'include');
-}
-if (!empty($accountWebsiteExcludes)) {
-    $sql .= " AND " . applyFilter('account_website', $accountWebsiteExcludes, 'exclude');
+if ($conn) {
+    $conn->close();
 }
 
-// Apply Industry filters
-if (!empty($accountIndustryContains)) {
-    $sql .= " AND " . applyFilter('account_industry', $accountIndustryContains, 'contains');
-}
-if (!empty($accountIndustryStartsWith)) {
-    $sql .= " AND " . applyFilter('account_industry', $accountIndustryStartsWith, 'starts_with');
-}
-if (!empty($accountIndustryIncludes)) {
-    $sql .= " AND " . applyFilter('account_industry', $accountIndustryIncludes, 'include');
-}
-if (!empty($accountIndustryExcludes)) {
-    $sql .= " AND " . applyFilter('account_industry', $accountIndustryExcludes, 'exclude');
-}
-
-// Apply Employee Count filters
-if (!empty($accountEmployeeCountContains)) {
-    $sql .= " AND " . applyFilter('account_employee_count_range', $accountEmployeeCountContains, 'contains');
-}
-if (!empty($accountEmployeeCountStartsWith)) {
-    $sql .= " AND " . applyFilter('account_employee_count_range', $accountEmployeeCountStartsWith, 'starts_with');
-}
-if (!empty($accountEmployeeCountIncludes)) {
-    $sql .= " AND " . applyFilter('account_employee_count_range', $accountEmployeeCountIncludes, 'include');
-}
-if (!empty($accountEmployeeCountExcludes)) {
-    $sql .= " AND " . applyFilter('account_employee_count_range', $accountEmployeeCountExcludes, 'exclude');
-}
-
-// Apply Founded Year filter
-if (!empty($accountFoundedYear)) {
-    $sql .= " AND `account_founded_year` = '$accountFoundedYear'";
-}
-
-// Apply Country filter
-if (!empty($country)) {
-    $countryConditions = [];
-    foreach ($country as $c) {
-        $escapedCountry = $conn->real_escape_string($c);
-        $countryConditions[] = "`account_country` = '$escapedCountry'";
-    }
-    if (!empty($countryConditions)) {
-        $sql .= " AND (" . implode(" OR ", $countryConditions) . ")";
-    }
-}
-
-// Apply City filter
-if (!empty($city)) {
-    $cityConditions = [];
-    foreach ($city as $c) {
-        $escapedCity = $conn->real_escape_string($c);
-        $cityConditions[] = "`account_city` = '$escapedCity'";
-    }
-    if (!empty($cityConditions)) {
-        $sql .= " AND (" . implode(" OR ", $cityConditions) . ")";
-    }
-}
-
-// Count total records with filters before adding LIMIT
-$totalFilteredRecordsSql = str_replace("SELECT *", "SELECT COUNT(*) as total", $sql);
-
-// Try to get filtered count from cache
-$filteredCountCacheKey = 'tuesday_filtered_count_' . md5($totalFilteredRecordsSql);
-$totalFilteredRecords = 0;
-
-if ($redis && $redis->exists($filteredCountCacheKey)) {
-    $totalFilteredRecords = (int)$redis->get($filteredCountCacheKey);
-} else {
-    $totalFilteredRecordsResult = $conn->query($totalFilteredRecordsSql);
-    if (!$totalFilteredRecordsResult) {
-        die("Error executing filtered records query: " . $conn->error);
-    }
-    $totalFilteredRecords = $totalFilteredRecordsResult->fetch_assoc()['total'];
-    if ($totalFilteredRecords === null) {
-        $totalFilteredRecords = 0;
-    }
-    
-    // Cache the filtered count
-    if ($redis) {
-        $redis->set($filteredCountCacheKey, $totalFilteredRecords);
-        $redis->expire($filteredCountCacheKey, $redisExpiry);
-    }
-}
-
-// Add LIMIT and OFFSET to the main query
-$sql .= " LIMIT $limit OFFSET $offset";
-
-// Execute main query
-$result = $conn->query($sql);
-
-if ($result === false) {
-    die(json_encode(array("error" => "Query failed: " . $conn->error)));
-}
-
-$data = array();
-if ($result->num_rows > 0) {
-    while ($row = $result->fetch_assoc()) {
-        $data[] = $row;
-    }
-}
-
-// Get total records in the table (without any filter)
-$totalRecordsCacheKey = 'tuesday_total_records';
-$totalRecords = 0;
-
-// Try to get total records from cache
-if ($redis && $redis->exists($totalRecordsCacheKey)) {
-    $totalRecords = (int)$redis->get($totalRecordsCacheKey);
-} else {
-    $totalRecordsSql = "SELECT COUNT(*) as total FROM data";
-    $totalRecordsResult = $conn->query($totalRecordsSql);
-    if (!$totalRecordsResult) {
-        die("Error executing total records query: " . $conn->error);
-    }
-    $totalRecords = $totalRecordsResult->fetch_assoc()['total'];
-    
-    // Cache the total records count
-    if ($redis) {
-        $redis->set($totalRecordsCacheKey, $totalRecords);
-        $redis->expire($totalRecordsCacheKey, $redisExpiry * 24); // Cache for longer since this rarely changes
-    }
-}
-
-// Calculate total pages
-$totalPages = ceil($totalFilteredRecords / $limit);
-
-// Prepare response
-$response = [
-    "draw" => isset($_POST['draw']) ? (int)$_POST['draw'] : 1,
-    "recordsTotal" => $totalRecords,
-    "recordsFiltered" => $totalFilteredRecords,
-    "data" => $data,
-    "totalPages" => $totalPages,
-    "start" => $offset,
-    "totalEntries" => $totalRecords,
-    "cached" => false
-];
-
-// Cache the response
-if ($redis) {
-    $redis->set($cacheKey, json_encode($response));
-    $redis->expire($cacheKey, $redisExpiry);
-}
-
-// Close the connection
-$conn->close();
-
-// Set JSON header and return the response
-header('Content-Type: application/json');
-echo json_encode($response, JSON_UNESCAPED_UNICODE);
 ?>
